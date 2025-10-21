@@ -2,187 +2,154 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
-#include <freertos/semphr.h>
 #include <freertos/event_groups.h>
-#include "esp_system.h" // ESP.restart()
+#include "esp_system.h" // Para ESP.restart()
 
-// --- Definições Globais e Primitivas do FreeRTOS ---
-
-QueueHandle_t xQueueDados; 
-
-// Event group bits (mais apropriado para flags persistentes)
-EventGroupHandle_t xEventGroup;
-#define BIT_GERACAO_ATIVA  (1 << 0)
-#define BIT_RECEPCAO_ATIVA (1 << 1)
-#define BIT_RECOVERY       (1 << 2)
-
-// Handlers das Tasks
-TaskHandle_t xHandleGerador = NULL;
-TaskHandle_t xHandleReceptor = NULL;
-TaskHandle_t xHandleSupervisor = NULL;
-
-// Timestamps de "feed" do WDT cooperativo
-volatile TickType_t xUltimoFeedWDT_Gerador = 0;
-volatile TickType_t xUltimoFeedWDT_Receptor = 0;
-volatile bool bFalhaCriticaRecepcao = false;
-
-// Configurações
+// ---------------- DEFINIÇÕES GLOBAIS ----------------
 #define TAMANHO_FILA 5
-#define TEMPO_LIMITE_RECEPCAO_MS 5000 
-#define WDT_TIMEOUT_MS 3000 // limite de WDT simulado
+#define TEMPO_LIMITE_RECEPCAO_MS 5000
+#define WDT_TIMEOUT_MS 3000
 
-// --- 1. Gerador (Producer) ---
-void vTaskGeracaoDados(void *pvParameters) {
-    int iValorSequencial = 0;
-    const TickType_t xDelay = pdMS_TO_TICKS(100);
+// Bits de status
+#define BIT_GERADOR_ATIVO   (1 << 0)
+#define BIT_RECEPTOR_ATIVO  (1 << 1)
+#define BIT_RECUPERANDO     (1 << 2)
 
-    // Marca como ativo
-    xEventGroupSetBits(xEventGroup, BIT_GERACAO_ATIVA);
+QueueHandle_t xQueueDados;
+EventGroupHandle_t xEventGroup;
 
-    while (1) {
-        iValorSequencial++;
+TaskHandle_t xHandleGerador, xHandleReceptor, xHandleSupervisor;
 
-        // Feed WDT (atualiza timestamp)
-        xUltimoFeedWDT_Gerador = xTaskGetTickCount();
+volatile TickType_t xFeedWDT_Gerador = 0;
+volatile TickType_t xFeedWDT_Receptor = 0;
+volatile bool falhaCritica = false;
 
-        // Também atualiza a flag de liveness no eventgroup a cada iteração
-        xEventGroupSetBits(xEventGroup, BIT_GERACAO_ATIVA);
+// ---------------- 1. MÓDULO DE GERAÇÃO ----------------
+void vTaskGerador(void *pvParameters) {
+  int valor = 0;
+  const TickType_t delayEnvio = pdMS_TO_TICKS(100);
 
-        // Tenta enviar sem bloquear muito; aqui esperamos até 10 ms antes de descartar
-        BaseType_t xStatus = xQueueSend(xQueueDados, &iValorSequencial, pdMS_TO_TICKS(10));
-        if (xStatus == pdPASS) {
-            Serial.printf("Gerador: enviado %d\n", iValorSequencial);
-        } else {
-            Serial.printf("Gerador: FILA CHEIA. Descartado %d\n", iValorSequencial);
-        }
+  xEventGroupSetBits(xEventGroup, BIT_GERADOR_ATIVO);
 
-        vTaskDelay(xDelay);
+  while (true) {
+    valor++;
+    xFeedWDT_Gerador = xTaskGetTickCount();
+    xEventGroupSetBits(xEventGroup, BIT_GERADOR_ATIVO);
+
+    if (xQueueSend(xQueueDados, &valor, pdMS_TO_TICKS(10)) == pdPASS) {
+      Serial.printf("Gerador: enviado %d\n", valor);
+    } else {
+      Serial.printf("Gerador: FILA CHEIA, valor %d descartado\n", valor);
     }
+
+    vTaskDelay(delayEnvio);
+  }
 }
 
-// --- 2. Receptor (Consumer) ---
-void vTaskRecepcaoDados(void *pvParameters) {
-    int iValorRecebido;
-    const TickType_t xTempoEsperaTicks = pdMS_TO_TICKS(TEMPO_LIMITE_RECEPCAO_MS);
+// ---------------- 2. MÓDULO DE RECEPÇÃO ----------------
+void vTaskReceptor(void *pvParameters) {
+  int valorRecebido;
+  const TickType_t tempoLimite = pdMS_TO_TICKS(TEMPO_LIMITE_RECEPCAO_MS);
+  int nivelFalha = 0;
+  const int MAX_FALHAS = 3;
 
-    int iNivelFalha = 0;
-    const int MAX_FALHAS_RECUPERAVEIS = 3;
+  xEventGroupSetBits(xEventGroup, BIT_RECEPTOR_ATIVO);
 
-    // Marca como ativo
-    xEventGroupSetBits(xEventGroup, BIT_RECEPCAO_ATIVA);
+  while (true) {
+    xFeedWDT_Receptor = xTaskGetTickCount();
+    xEventGroupSetBits(xEventGroup, BIT_RECEPTOR_ATIVO);
 
-    while (1) {
-        // Feed WDT
-        xUltimoFeedWDT_Receptor = xTaskGetTickCount();
+    if (xQueueReceive(xQueueDados, &valorRecebido, tempoLimite) == pdPASS) {
+      // Simula uso de memória dinâmica
+      int *pValor = (int *)malloc(sizeof(int));
+      if (pValor) {
+        *pValor = valorRecebido;
+        Serial.printf("Receptor: recebido %d -> transmitindo (simulado)\n", *pValor);
+        free(pValor);
+      }
 
-        // Atualiza liveness
-        xEventGroupSetBits(xEventGroup, BIT_RECEPCAO_ATIVA);
-
-        if (xQueueReceive(xQueueDados, &iValorRecebido, xTempoEsperaTicks) == pdPASS) {
-            // Evita malloc: usar variável local (stack) suficiente para um int
-            int tmp = iValorRecebido;
-            Serial.printf("Receptor: Recebido %d -> transmitindo (simulado)\n", tmp);
-
-            // Reset falhas
-            iNivelFalha = 0;
-            bFalhaCriticaRecepcao = false;
-
-            // Limpa flag recovery se estava setada
-            xEventGroupClearBits(xEventGroup, BIT_RECOVERY);
-        } else {
-            // Timeout de recepção
-            iNivelFalha++;
-            if (iNivelFalha <= MAX_FALHAS_RECUPERAVEIS) {
-                Serial.printf("Receptor: AVISO (nivel %d) - timeout de recepcao. Tentando recuperar.\n", iNivelFalha);
-                bFalhaCriticaRecepcao = false;
-                xEventGroupSetBits(xEventGroup, BIT_RECOVERY);
-                // Aqui poderia haver uma ação de recuperação (reconfigurar periférico)
-            } else {
-                Serial.println("Receptor: FALHA CRÍTICA! max tentativas esgotado.");
-                bFalhaCriticaRecepcao = true;
-                // Opcional: suspender ou reiniciar a própria tarefa antes do WDT agir
-                // vTaskSuspend(NULL); // comente/descomente conforme intenção
-            }
-        }
+      nivelFalha = 0;
+      falhaCritica = false;
+      xEventGroupClearBits(xEventGroup, BIT_RECUPERANDO);
+    } else {
+      nivelFalha++;
+      if (nivelFalha <= MAX_FALHAS) {
+        Serial.printf("Receptor: aviso %d - timeout sem dados. Recuperando...\n", nivelFalha);
+        xEventGroupSetBits(xEventGroup, BIT_RECUPERANDO);
+      } else {
+        Serial.println("Receptor: FALHA CRÍTICA! Encerrando módulo de recepção.");
+        falhaCritica = true;
+        vTaskSuspend(NULL);
+      }
     }
+  }
 }
 
-// --- 3. Supervisor ---
-void vTaskSupervisao(void *pvParameters) {
-    const TickType_t xDelayStatus = pdMS_TO_TICKS(1000);
-    const TickType_t xLimiteWDT = pdMS_TO_TICKS(WDT_TIMEOUT_MS);
+// ---------------- 3. MÓDULO DE SUPERVISÃO ----------------
+void vTaskSupervisor(void *pvParameters) {
+  const TickType_t intervalo = pdMS_TO_TICKS(1000);
+  const TickType_t limiteWDT = pdMS_TO_TICKS(WDT_TIMEOUT_MS);
 
-    while (1) {
-        // Lê bits do EventGroup (não remove)
-        EventBits_t uxBits = xEventGroupGetBits(xEventGroup);
+  while (true) {
+    EventBits_t bits = xEventGroupGetBits(xEventGroup);
+    TickType_t agora = xTaskGetTickCount();
 
-        Serial.println("\n--- Supervisor: status ---");
-        Serial.printf("Gerador: %s\n", (uxBits & BIT_GERACAO_ATIVA) ? "ATIVO" : "INATIVO");
-        Serial.printf("Receptor: %s\n", (uxBits & BIT_RECEPCAO_ATIVA) ? "ATIVO" : "INATIVO");
-        if (uxBits & BIT_RECOVERY) Serial.println("Receptor: EM RECUPERACAO");
-        if (bFalhaCriticaRecepcao) Serial.println("Receptor: FALHA CRITICA DETECTADA");
+    Serial.println("\n--- STATUS DO SISTEMA ---");
+    Serial.printf("Gerador: %s\n", (bits & BIT_GERADOR_ATIVO) ? "ATIVO" : "INATIVO");
+    Serial.printf("Receptor: %s\n", (bits & BIT_RECEPTOR_ATIVO) ? "ATIVO" : "INATIVO");
+    if (bits & BIT_RECUPERANDO) Serial.println("Receptor: EM RECUPERAÇÃO");
+    if (falhaCritica) Serial.println("Receptor: FALHA CRÍTICA DETECTADA");
 
-        // Verificacao WDT cooperativa
-        TickType_t now = xTaskGetTickCount();
-        TickType_t dtGer = now - xUltimoFeedWDT_Gerador;
-        TickType_t dtRec = now - xUltimoFeedWDT_Receptor;
+    TickType_t dtGer = agora - xFeedWDT_Gerador;
+    TickType_t dtRec = agora - xFeedWDT_Receptor;
 
-        Serial.println("--- Monitor WDT ---");
-        if (dtGer > xLimiteWDT) {
-            Serial.printf("WDT: Gerador nao alimentado por %u ms -> REBOOT\n", pdTICKS_TO_MS(dtGer));
-            ESP.restart();
-        } else {
-            Serial.printf("Gerador OK (ult feed %u ms)\n", pdTICKS_TO_MS(dtGer));
-        }
-
-        if (dtRec > xLimiteWDT) {
-            Serial.printf("WDT: Receptor nao alimentado por %u ms -> REBOOT\n", pdTICKS_TO_MS(dtRec));
-            ESP.restart();
-        } else {
-            Serial.printf("Receptor OK (ult feed %u ms)\n", pdTICKS_TO_MS(dtRec));
-        }
-
-        Serial.println("-------------------------\n");
-
-        // Como usamos event group para liveness, podemos limpar bits de ATIVO aqui
-        // para forçar as tasks a setarem novamente em sua proxima iteracao
-        xEventGroupClearBits(xEventGroup, BIT_GERACAO_ATIVA | BIT_RECEPCAO_ATIVA);
-
-        vTaskDelay(xDelayStatus);
+    Serial.println("--- Watchdog ---");
+    if (dtGer > limiteWDT) {
+      Serial.printf("WDT: Gerador inativo por %u ms -> Reiniciando sistema...\n", pdTICKS_TO_MS(dtGer));
+      ESP.restart();
+    } else {
+      Serial.printf("Gerador OK (último feed %u ms)\n", pdTICKS_TO_MS(dtGer));
     }
+
+    if (dtRec > limiteWDT) {
+      Serial.printf("WDT: Receptor inativo por %u ms -> Reiniciando sistema...\n", pdTICKS_TO_MS(dtRec));
+      ESP.restart();
+    } else {
+      Serial.printf("Receptor OK (último feed %u ms)\n", pdTICKS_TO_MS(dtRec));
+    }
+
+    Serial.println("-------------------------\n");
+
+    // Limpa flags ativas (obrigando as tarefas a renová-las)
+    xEventGroupClearBits(xEventGroup, BIT_GERADOR_ATIVO | BIT_RECEPTOR_ATIVO);
+
+    vTaskDelay(intervalo);
+  }
 }
 
-// --- Setup / Loop ---
+// ---------------- SETUP ----------------
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("Inicio sistema FreeRTOS - versao corrigida");
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("=== Sistema de Dados Robusto - FreeRTOS ===");
 
-    xQueueDados = xQueueCreate(TAMANHO_FILA, sizeof(int));
-    if (!xQueueDados) {
-        Serial.println("ERRO: nao foi possivel criar fila");
-        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+  xQueueDados = xQueueCreate(TAMANHO_FILA, sizeof(int));
+  xEventGroup = xEventGroupCreate();
 
-    // Criar EventGroup
-    xEventGroup = xEventGroupCreate();
-    if (!xEventGroup) {
-        Serial.println("ERRO: nao foi possivel criar event group");
-        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+  if (!xQueueDados || !xEventGroup) {
+    Serial.println("Erro ao criar primitivas FreeRTOS!");
+    while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+  }
 
-    // Inicializa timestamps para evitar falso positivo
-    TickType_t now = xTaskGetTickCount();
-    xUltimoFeedWDT_Gerador = now;
-    xUltimoFeedWDT_Receptor = now;
+  TickType_t agora = xTaskGetTickCount();
+  xFeedWDT_Gerador = agora;
+  xFeedWDT_Receptor = agora;
 
-    // Cria tasks
-    xTaskCreatePinnedToCore(vTaskGeracaoDados, "GeradorDados", 4096, NULL, 1, &xHandleGerador, 1);
-    xTaskCreatePinnedToCore(vTaskRecepcaoDados, "ReceptorDados", 4096, NULL, 2, &xHandleReceptor, 1);
-    xTaskCreatePinnedToCore(vTaskSupervisao, "Supervisor", 3072, NULL, 3, &xHandleSupervisor, 0);
+  xTaskCreatePinnedToCore(vTaskGerador, "Gerador", 4096, NULL, 1, &xHandleGerador, 1);
+  xTaskCreatePinnedToCore(vTaskReceptor, "Receptor", 4096, NULL, 2, &xHandleReceptor, 1);
+  xTaskCreatePinnedToCore(vTaskSupervisor, "Supervisor", 4096, NULL, 3, &xHandleSupervisor, 0);
 }
 
 void loop() {
-    // Deleta a task loop() do Arduino - mantemos tudo em FreeRTOS tasks
-    vTaskDelete(NULL);
+  vTaskDelete(NULL);
 }
