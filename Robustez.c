@@ -3,31 +3,41 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/event_groups.h>
-#include "esp_system.h" // Para ESP.restart()
+#include "esp_system.h" // para ESP.restart()
 
-// ---------------- DEFINIÇÕES GLOBAIS ----------------
-#define TAMANHO_FILA 5
-#define TEMPO_LIMITE_RECEPCAO_MS 5000
-#define WDT_TIMEOUT_MS 3000
+// =====================================================
+// IDENTIFICAÇÃO
+#define ALUNO_NOME "Heitor"
+#define ALUNO_RM   "88594"
 
-// Bits de status
+// =====================================================
+// CONFIGURAÇÕES
+#define TAMANHO_FILA              5
+#define TEMPO_LIMITE_RECEPCAO_MS  5000
+#define WDT_TIMEOUT_MS            3000
+
+// =====================================================
+// FLAGS (EventGroup)
 #define BIT_GERADOR_ATIVO   (1 << 0)
 #define BIT_RECEPTOR_ATIVO  (1 << 1)
 #define BIT_RECUPERANDO     (1 << 2)
 
-QueueHandle_t xQueueDados;
+// =====================================================
+// VARIÁVEIS GLOBAIS
+QueueHandle_t xFilaDados;
 EventGroupHandle_t xEventGroup;
 
-TaskHandle_t xHandleGerador, xHandleReceptor, xHandleSupervisor;
+TaskHandle_t xTaskGerador, xTaskReceptor, xTaskSupervisor;
 
 volatile TickType_t xFeedWDT_Gerador = 0;
 volatile TickType_t xFeedWDT_Receptor = 0;
 volatile bool falhaCritica = false;
 
-// ---------------- 1. MÓDULO DE GERAÇÃO ----------------
+// =====================================================
+// MÓDULO 1: GERAÇÃO DE DADOS
 void vTaskGerador(void *pvParameters) {
   int valor = 0;
-  const TickType_t delayEnvio = pdMS_TO_TICKS(100);
+  const TickType_t intervalo = pdMS_TO_TICKS(200);
 
   xEventGroupSetBits(xEventGroup, BIT_GERADOR_ATIVO);
 
@@ -36,20 +46,21 @@ void vTaskGerador(void *pvParameters) {
     xFeedWDT_Gerador = xTaskGetTickCount();
     xEventGroupSetBits(xEventGroup, BIT_GERADOR_ATIVO);
 
-    if (xQueueSend(xQueueDados, &valor, pdMS_TO_TICKS(10)) == pdPASS) {
-      Serial.printf("Gerador: enviado %d\n", valor);
+    if (xQueueSend(xFilaDados, &valor, pdMS_TO_TICKS(10)) == pdPASS) {
+      Serial.printf("{%s-RM:%s} [FILA] Dado %d enviado com sucesso!\n", ALUNO_NOME, ALUNO_RM, valor);
     } else {
-      Serial.printf("Gerador: FILA CHEIA, valor %d descartado\n", valor);
+      Serial.printf("{%s-RM:%s} [FILA] Cheia! Dado %d descartado.\n", ALUNO_NOME, ALUNO_RM, valor);
     }
 
-    vTaskDelay(delayEnvio);
+    vTaskDelay(intervalo);
   }
 }
 
-// ---------------- 2. MÓDULO DE RECEPÇÃO ----------------
+// =====================================================
+// MÓDULO 2: RECEPÇÃO DE DADOS
 void vTaskReceptor(void *pvParameters) {
   int valorRecebido;
-  const TickType_t tempoLimite = pdMS_TO_TICKS(TEMPO_LIMITE_RECEPCAO_MS);
+  const TickType_t tempoMaximo = pdMS_TO_TICKS(TEMPO_LIMITE_RECEPCAO_MS);
   int nivelFalha = 0;
   const int MAX_FALHAS = 3;
 
@@ -59,12 +70,12 @@ void vTaskReceptor(void *pvParameters) {
     xFeedWDT_Receptor = xTaskGetTickCount();
     xEventGroupSetBits(xEventGroup, BIT_RECEPTOR_ATIVO);
 
-    if (xQueueReceive(xQueueDados, &valorRecebido, tempoLimite) == pdPASS) {
-      // Simula uso de memória dinâmica
+    if (xQueueReceive(xFilaDados, &valorRecebido, tempoMaximo) == pdPASS) {
+      // malloc e free obrigatórios
       int *pValor = (int *)malloc(sizeof(int));
-      if (pValor) {
+      if (pValor != NULL) {
         *pValor = valorRecebido;
-        Serial.printf("Receptor: recebido %d -> transmitindo (simulado)\n", *pValor);
+        Serial.printf("{%s-RM:%s} [TX] Valor recebido: %d -> Transmitindo...\n", ALUNO_NOME, ALUNO_RM, *pValor);
         free(pValor);
       }
 
@@ -74,18 +85,19 @@ void vTaskReceptor(void *pvParameters) {
     } else {
       nivelFalha++;
       if (nivelFalha <= MAX_FALHAS) {
-        Serial.printf("Receptor: aviso %d - timeout sem dados. Recuperando...\n", nivelFalha);
+        Serial.printf("{%s-RM:%s} [RX-AVISO] Timeout sem dados (%d). Tentando recuperar...\n", ALUNO_NOME, ALUNO_RM, nivelFalha);
         xEventGroupSetBits(xEventGroup, BIT_RECUPERANDO);
       } else {
-        Serial.println("Receptor: FALHA CRÍTICA! Encerrando módulo de recepção.");
+        Serial.printf("{%s-RM:%s} [RX-ERRO] FALHA CRÍTICA! Módulo encerrado.\n", ALUNO_NOME, ALUNO_RM);
         falhaCritica = true;
-        vTaskSuspend(NULL);
+        vTaskSuspend(NULL); // encerra a tarefa
       }
     }
   }
 }
 
-// ---------------- 3. MÓDULO DE SUPERVISÃO ----------------
+// =====================================================
+// MÓDULO 3: SUPERVISÃO
 void vTaskSupervisor(void *pvParameters) {
   const TickType_t intervalo = pdMS_TO_TICKS(1000);
   const TickType_t limiteWDT = pdMS_TO_TICKS(WDT_TIMEOUT_MS);
@@ -94,50 +106,53 @@ void vTaskSupervisor(void *pvParameters) {
     EventBits_t bits = xEventGroupGetBits(xEventGroup);
     TickType_t agora = xTaskGetTickCount();
 
-    Serial.println("\n--- STATUS DO SISTEMA ---");
-    Serial.printf("Gerador: %s\n", (bits & BIT_GERADOR_ATIVO) ? "ATIVO" : "INATIVO");
-    Serial.printf("Receptor: %s\n", (bits & BIT_RECEPTOR_ATIVO) ? "ATIVO" : "INATIVO");
-    if (bits & BIT_RECUPERANDO) Serial.println("Receptor: EM RECUPERAÇÃO");
-    if (falhaCritica) Serial.println("Receptor: FALHA CRÍTICA DETECTADA");
+    Serial.println("\n========= STATUS DO SISTEMA =========");
+    Serial.printf("{%s-RM:%s} [STATUS] Gerador: %s\n", ALUNO_NOME, ALUNO_RM,
+                  (bits & BIT_GERADOR_ATIVO) ? "ATIVO" : "INATIVO");
+    Serial.printf("{%s-RM:%s} [STATUS] Receptor: %s\n", ALUNO_NOME, ALUNO_RM,
+                  (bits & BIT_RECEPTOR_ATIVO) ? "ATIVO" : "INATIVO");
+    if (bits & BIT_RECUPERANDO)
+      Serial.printf("{%s-RM:%s} [STATUS] Receptor em RECUPERAÇÃO.\n", ALUNO_NOME, ALUNO_RM);
+    if (falhaCritica)
+      Serial.printf("{%s-RM:%s} [STATUS] FALHA CRÍTICA detectada.\n", ALUNO_NOME, ALUNO_RM);
 
+    // Simula Watchdog Timer cooperativo
     TickType_t dtGer = agora - xFeedWDT_Gerador;
     TickType_t dtRec = agora - xFeedWDT_Receptor;
 
-    Serial.println("--- Watchdog ---");
     if (dtGer > limiteWDT) {
-      Serial.printf("WDT: Gerador inativo por %u ms -> Reiniciando sistema...\n", pdTICKS_TO_MS(dtGer));
+      Serial.printf("{%s-RM:%s} [WDT] Gerador travado (%u ms). Reiniciando...\n",
+                    ALUNO_NOME, ALUNO_RM, pdTICKS_TO_MS(dtGer));
       ESP.restart();
-    } else {
-      Serial.printf("Gerador OK (último feed %u ms)\n", pdTICKS_TO_MS(dtGer));
     }
 
     if (dtRec > limiteWDT) {
-      Serial.printf("WDT: Receptor inativo por %u ms -> Reiniciando sistema...\n", pdTICKS_TO_MS(dtRec));
+      Serial.printf("{%s-RM:%s} [WDT] Receptor travado (%u ms). Reiniciando...\n",
+                    ALUNO_NOME, ALUNO_RM, pdTICKS_TO_MS(dtRec));
       ESP.restart();
-    } else {
-      Serial.printf("Receptor OK (último feed %u ms)\n", pdTICKS_TO_MS(dtRec));
     }
 
-    Serial.println("-------------------------\n");
+    Serial.println("=====================================\n");
 
-    // Limpa flags ativas (obrigando as tarefas a renová-las)
+    // Limpa flags para forçar atualização
     xEventGroupClearBits(xEventGroup, BIT_GERADOR_ATIVO | BIT_RECEPTOR_ATIVO);
-
     vTaskDelay(intervalo);
   }
 }
 
-// ---------------- SETUP ----------------
+// =====================================================
+// SETUP E LOOP
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("=== Sistema de Dados Robusto - FreeRTOS ===");
+  Serial.printf("\n{%s-RM:%s} [INIT] Sistema de Dados Robusto iniciado.\n", ALUNO_NOME, ALUNO_RM);
 
-  xQueueDados = xQueueCreate(TAMANHO_FILA, sizeof(int));
+  // Cria fila e EventGroup
+  xFilaDados = xQueueCreate(TAMANHO_FILA, sizeof(int));
   xEventGroup = xEventGroupCreate();
 
-  if (!xQueueDados || !xEventGroup) {
-    Serial.println("Erro ao criar primitivas FreeRTOS!");
+  if (!xFilaDados || !xEventGroup) {
+    Serial.printf("{%s-RM:%s} [ERRO] Falha ao criar estruturas FreeRTOS!\n", ALUNO_NOME, ALUNO_RM);
     while (true) vTaskDelay(pdMS_TO_TICKS(1000));
   }
 
@@ -145,9 +160,10 @@ void setup() {
   xFeedWDT_Gerador = agora;
   xFeedWDT_Receptor = agora;
 
-  xTaskCreatePinnedToCore(vTaskGerador, "Gerador", 4096, NULL, 1, &xHandleGerador, 1);
-  xTaskCreatePinnedToCore(vTaskReceptor, "Receptor", 4096, NULL, 2, &xHandleReceptor, 1);
-  xTaskCreatePinnedToCore(vTaskSupervisor, "Supervisor", 4096, NULL, 3, &xHandleSupervisor, 0);
+  // Criação das tarefas
+  xTaskCreatePinnedToCore(vTaskGerador, "Gerador", 4096, NULL, 1, &xTaskGerador, 1);
+  xTaskCreatePinnedToCore(vTaskReceptor, "Receptor", 4096, NULL, 2, &xTaskReceptor, 1);
+  xTaskCreatePinnedToCore(vTaskSupervisor, "Supervisor", 4096, NULL, 3, &xTaskSupervisor, 0);
 }
 
 void loop() {
